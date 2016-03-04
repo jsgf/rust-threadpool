@@ -12,6 +12,7 @@
 
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 trait FnBox {
@@ -26,21 +27,31 @@ impl<F: FnOnce()> FnBox for F {
 
 type Thunk<'a> = Box<FnBox + Send + 'a>;
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug)]
 struct Counters {
-    count: usize,
-    count_max: usize,
+    count: AtomicUsize,
+    count_max: AtomicUsize,
+}
+
+impl Clone for Counters {
+    fn clone(&self) -> Self {
+        // non-atomic
+        Counters {
+            count: AtomicUsize::new(self.count.load(Ordering::Relaxed)),
+            count_max: AtomicUsize::new(self.count_max.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 struct Sentinel<'a> {
     jobs: &'a Arc<Mutex<Receiver<Thunk<'static>>>>,
-    counters: &'a Arc<Mutex<Counters>>,
+    counters: &'a Arc<Counters>,
     active: bool
 }
 
 impl<'a> Sentinel<'a> {
     fn new(jobs: &'a Arc<Mutex<Receiver<Thunk<'static>>>>,
-           counters: &'a Arc<Mutex<Counters>>) -> Sentinel<'a> {
+           counters: &'a Arc<Counters>) -> Sentinel<'a> {
         Sentinel {
             jobs: jobs,
             counters: counters,
@@ -57,7 +68,7 @@ impl<'a> Sentinel<'a> {
 impl<'a> Drop for Sentinel<'a> {
     fn drop(&mut self) {
         if self.active {
-            self.counters.lock().unwrap().count -= 1;
+            self.counters.count.fetch_sub(1, Ordering::Relaxed);
             spawn_in_pool(self.jobs.clone(), self.counters.clone())
         }
     }
@@ -94,7 +105,7 @@ pub struct ThreadPool {
     // quit.
     jobs: Sender<Thunk<'static>>,
     job_receiver: Arc<Mutex<Receiver<Thunk<'static>>>>,
-    counters: Arc<Mutex<Counters>>,
+    counters: Arc<Counters>,
 }
 
 impl ThreadPool {
@@ -108,7 +119,7 @@ impl ThreadPool {
 
         let (tx, rx) = channel::<Thunk<'static>>();
         let rx = Arc::new(Mutex::new(rx));
-        let counts = Arc::new(Mutex::new(Counters { count: 0, count_max: threads }));
+        let counts = Arc::new(Counters { count: AtomicUsize::new(0), count_max: AtomicUsize::new(threads) });
 
         // Threadpool threads
         for _ in 0..threads {
@@ -131,12 +142,12 @@ impl ThreadPool {
 
     /// Returns the number of currently active threads.
     pub fn active_count(&self) -> usize {
-        self.counters.lock().unwrap().count
+        self.counters.count.load(Ordering::Relaxed)
     }
 
     /// Returns the number of created threads
     pub fn max_count(&self) -> usize {
-        self.counters.lock().unwrap().count_max
+        self.counters.count_max.load(Ordering::Relaxed)
     }
 
     /// Sets the number of threads to use as `threads`.
@@ -144,12 +155,7 @@ impl ThreadPool {
     pub fn set_threads(&mut self, threads: usize) {
         assert!(threads >= 1);
 
-        let mut current_max = threads;
-        {
-            use std::mem;
-            let mut counters = self.counters.lock().unwrap();
-            mem::swap(&mut counters.count_max, &mut current_max)
-        }
+        let current_max = self.counters.count_max.swap(threads, Ordering::Relaxed);
 
         if threads > current_max {
             // Spawn new threads
@@ -161,14 +167,16 @@ impl ThreadPool {
 }
 
 fn spawn_in_pool(jobs: Arc<Mutex<Receiver<Thunk<'static>>>>,
-                 counts: Arc<Mutex<Counters>>) {
+                 counts: Arc<Counters>) {
     thread::spawn(move || {
         // Will spawn a new thread on panic unless it is cancelled.
         let sentinel = Sentinel::new(&jobs, &counts);
 
         loop {
             // clone values so that the mutexes are not held
-            let Counters { count, count_max } = *counts.lock().unwrap();
+            let count = counts.count.load(Ordering::Relaxed);
+            let count_max = counts.count_max.load(Ordering::Relaxed);
+
             if count < count_max {
                 let message = {
                     // Only lock jobs for the time it takes
@@ -179,9 +187,9 @@ fn spawn_in_pool(jobs: Arc<Mutex<Receiver<Thunk<'static>>>>,
 
                 match message {
                     Ok(job) => {
-                        counts.lock().unwrap().count += 1;
+                        counts.count.fetch_add(1, Ordering::Relaxed);
                         job.call_box();
-                        counts.lock().unwrap().count -= 1;
+                        counts.count.fetch_sub(1, Ordering::Relaxed);
                     },
 
                     // The Threadpool was dropped.
