@@ -11,3 +11,15 @@ documentation = "https://frewsxcv.github.io/rust-threadpool"
 description = """
 A thread pool for running a number of jobs on a fixed set of worker threads.
 """
+
+[[test]]
+name = "criterion"
+path = "tests/criterion.rs"
+
+[features]
+unstable = ["criterion", "criterion-macros"]
+
+[dependencies]
+#criterion = { git = "https://github.com/japaric/criterion.rs.git" }
+criterion = { path = "../criterion.rs", optional=true }
+criterion-macros = { path = "../criterion.rs/macros", optional=true }
